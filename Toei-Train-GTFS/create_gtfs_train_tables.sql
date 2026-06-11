@@ -1,5 +1,9 @@
 BEGIN;
 
+CREATE EXTENSION IF NOT EXISTS postgis;
+
+DROP TABLE IF EXISTS mlit_raw_rail_segments CASCADE;
+DROP TABLE IF EXISTS mlit_route_geometries CASCADE;
 DROP TABLE IF EXISTS gtfs_train_stop_times CASCADE;
 DROP TABLE IF EXISTS gtfs_train_shapes CASCADE;
 DROP TABLE IF EXISTS gtfs_train_trips CASCADE;
@@ -22,6 +26,20 @@ CREATE TABLE gtfs_train_agency (
     agency_phone TEXT,
     agency_fare_url TEXT,
     agency_email TEXT
+);
+
+CREATE TABLE mlit_raw_rail_segments (
+    id BIGSERIAL PRIMARY KEY,
+    operator_name TEXT,
+    line_name TEXT,
+    geom geometry(LineString, 4326)
+);
+
+CREATE TABLE mlit_route_geometries (
+    route_id TEXT PRIMARY KEY,
+    operator_name TEXT,
+    line_name TEXT,
+    geom geometry(Geometry, 4326)
 );
 
 CREATE TABLE gtfs_train_calendar (
@@ -105,6 +123,9 @@ CREATE TABLE gtfs_train_shapes (
     shape_pt_lon DOUBLE PRECISION,
     shape_pt_sequence INTEGER,
     shape_dist_traveled NUMERIC(12,3),
+    cumulative_distance_m NUMERIC(12,3),
+    pref_code TEXT,
+    agency_id TEXT,
     PRIMARY KEY (shape_id, shape_pt_sequence)
 );
 
