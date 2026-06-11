@@ -45,6 +45,9 @@ public final class App {
 
             System.out.println("Connected to: " + connection.getMetaData().getURL());
             GtfsImporter.importAll(connection);
+            System.out.println();
+            RouteStopPrinter.printLongestRouteStops(connection);
+            System.out.println();
             boolean hasResultSet = statement.execute(sql);
 
             if (hasResultSet) {

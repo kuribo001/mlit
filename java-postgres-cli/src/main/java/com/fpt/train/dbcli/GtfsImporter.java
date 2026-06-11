@@ -36,6 +36,8 @@ public final class GtfsImporter {
     private static final Map<String, String> TOEI_LINE_ROUTE_MAP = createToeiLineRouteMap();
     private static final Pattern COORDINATE_PATTERN =
         Pattern.compile("\\[\\s*([-0-9.]+)\\s*,\\s*([-0-9.]+)\\s*\\]");
+    private static final Pattern WKT_COORDINATE_PATTERN =
+        Pattern.compile("([-0-9.]+)\\s+([-0-9.]+)");
 
     private GtfsImporter() {
     }
@@ -77,7 +79,25 @@ public final class GtfsImporter {
             }
 
             try {
-                long rowCount = importToeiMlitShapes(connection, resolveMlitRailGeoJson());
+                long rawCount = importRawMlitRailSegments(connection, resolveMlitRailGeoJson());
+                connection.commit();
+                System.out.printf("Imported %-30s -> %-28s %,d row(s)%n", "MLIT raw rail", "mlit_raw_rail_segments", rawCount);
+            } catch (SQLException | RuntimeException e) {
+                connection.rollback();
+                throw e;
+            }
+
+            try {
+                long rowCount = importMlitRouteGeometries(connection);
+                connection.commit();
+                System.out.printf("Imported %-30s -> %-28s %,d row(s)%n", "MLIT merged rail", "mlit_route_geometries", rowCount);
+            } catch (SQLException | RuntimeException e) {
+                connection.rollback();
+                throw e;
+            }
+
+            try {
+                long rowCount = importToeiShapesFromRouteGeometries(connection);
                 connection.commit();
                 System.out.printf("Imported %-30s -> %-28s %,d row(s)%n", "MLIT Toei rail", "gtfs_train_shapes", rowCount);
             } catch (SQLException | RuntimeException e) {
@@ -181,31 +201,29 @@ public final class GtfsImporter {
         }
     }
 
-    private static long importToeiMlitShapes(Connection connection, Path geoJsonFile) throws SQLException {
+    private static long importRawMlitRailSegments(Connection connection, Path geoJsonFile) throws SQLException {
         if (!Files.exists(geoJsonFile)) {
             throw new IllegalStateException("Không tìm thấy file MLIT rail GeoJSON: " + geoJsonFile.toAbsolutePath());
         }
 
         String sql = """
-            INSERT INTO gtfs_train_shapes (
-                shape_id,
-                shape_pt_lat,
-                shape_pt_lon,
-                shape_pt_sequence,
-                shape_dist_traveled
-            ) VALUES (?, ?, ?, ?, ?)
+            INSERT INTO mlit_raw_rail_segments (
+                operator_name,
+                line_name,
+                geom
+            ) VALUES (?, ?, ST_GeomFromText(?, 4326))
             """;
 
         long rowCount = 0L;
         int batchCount = 0;
-        int featureIndex = 0;
 
         try (BufferedReader reader = Files.newBufferedReader(geoJsonFile, StandardCharsets.UTF_8);
              PreparedStatement preparedStatement = connection.prepareStatement(sql)) {
             String line;
             while ((line = reader.readLine()) != null) {
+                String operatorName = extractJsonString(line, "\"N02_004\":\"");
                 String lineName = extractJsonString(line, "\"N02_003\":\"");
-                if (lineName == null || !TOEI_LINE_ROUTE_MAP.containsKey(lineName)) {
+                if (operatorName == null || lineName == null) {
                     continue;
                 }
 
@@ -214,33 +232,16 @@ public final class GtfsImporter {
                     continue;
                 }
 
-                featureIndex++;
-                String routeId = TOEI_LINE_ROUTE_MAP.get(lineName);
-                String shapeId = "toei_mlit_r" + routeId + "_seg" + String.format("%03d", featureIndex);
-                double dist = 0.0;
+                preparedStatement.setString(1, operatorName);
+                preparedStatement.setString(2, lineName);
+                preparedStatement.setString(3, toLineStringWkt(coordinates));
+                preparedStatement.addBatch();
+                rowCount++;
+                batchCount++;
 
-                for (int i = 0; i < coordinates.size(); i++) {
-                    double lon = coordinates.get(i)[0];
-                    double lat = coordinates.get(i)[1];
-
-                    if (i > 0) {
-                        double[] prev = coordinates.get(i - 1);
-                        dist += distanceMeters(prev[1], prev[0], lat, lon);
-                    }
-
-                    preparedStatement.setString(1, shapeId);
-                    preparedStatement.setDouble(2, lat);
-                    preparedStatement.setDouble(3, lon);
-                    preparedStatement.setInt(4, i);
-                    preparedStatement.setBigDecimal(5, java.math.BigDecimal.valueOf(dist).setScale(3, java.math.RoundingMode.HALF_UP));
-                    preparedStatement.addBatch();
-                    rowCount++;
-                    batchCount++;
-
-                    if (batchCount >= BATCH_SIZE) {
-                        preparedStatement.executeBatch();
-                        batchCount = 0;
-                    }
+                if (batchCount >= BATCH_SIZE) {
+                    preparedStatement.executeBatch();
+                    batchCount = 0;
                 }
             }
 
@@ -252,6 +253,157 @@ public final class GtfsImporter {
         }
 
         return rowCount;
+    }
+
+    private static long importMlitRouteGeometries(Connection connection) throws SQLException {
+        String sql = """
+            INSERT INTO mlit_route_geometries (
+                route_id,
+                operator_name,
+                line_name,
+                geom
+            )
+            WITH route_map(route_id, line_name) AS (
+                VALUES
+                    ('1', '1号線浅草線'),
+                    ('2', '6号線三田線'),
+                    ('3', '10号線新宿線'),
+                    ('4', '12号線大江戸線'),
+                    ('5', '日暮里・舎人ライナー'),
+                    ('6', '荒川線')
+            )
+            SELECT
+                rm.route_id,
+                '東京都' AS operator_name,
+                rm.line_name,
+                ST_LineMerge(ST_UnaryUnion(ST_Collect(r.geom))) AS geom
+            FROM route_map rm
+            JOIN mlit_raw_rail_segments r
+                ON r.operator_name = '東京都'
+               AND r.line_name = rm.line_name
+            GROUP BY rm.route_id, rm.line_name
+            """;
+
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            return statement.executeUpdate();
+        }
+    }
+
+    private static long importToeiShapesFromRouteGeometries(Connection connection) throws SQLException {
+        String sql = """
+            trip_lengths AS (
+                SELECT
+                    t.route_id,
+                    t.trip_id,
+                    COUNT(*) AS stop_count,
+                    MAX(st.stop_sequence) AS max_stop_sequence
+                FROM gtfs_train_trips t
+                JOIN gtfs_train_stop_times st
+                    ON st.trip_id = t.trip_id
+                GROUP BY t.route_id, t.trip_id
+            ),
+            ranked_trips AS (
+                SELECT
+                    route_id,
+                    trip_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY route_id
+                        ORDER BY stop_count DESC, max_stop_sequence DESC, trip_id
+                    ) AS rn
+                FROM trip_lengths
+            ),
+            route_stops AS (
+                SELECT
+                    r.route_id,
+                    r.route_long_name,
+                    rt.trip_id,
+                    st.stop_sequence,
+                    st.stop_id,
+                    s.stop_name,
+                    ST_SetSRID(ST_MakePoint(s.stop_lon::double precision, s.stop_lat::double precision), 4326) AS stop_geom
+                FROM ranked_trips rt
+                JOIN gtfs_train_routes r
+                    ON r.route_id = rt.route_id
+                JOIN gtfs_train_stop_times st
+                    ON st.trip_id = rt.trip_id
+                JOIN gtfs_train_stops s
+                    ON s.stop_id = st.stop_id
+                WHERE rt.rn = 1
+                  AND rt.route_id <> '4'
+            ),
+            measured_stops AS (
+                SELECT
+                    rs.route_id,
+                    rs.route_long_name,
+                    rs.trip_id,
+                    rs.stop_sequence,
+                    rs.stop_id,
+                    rs.stop_name,
+                    rg.geom AS route_geom,
+                    ST_ClosestPoint(rg.geom, rs.stop_geom) AS snapped_geom,
+                    ST_LineLocatePoint(rg.geom, ST_ClosestPoint(rg.geom, rs.stop_geom)) AS measure
+                FROM route_stops rs
+                JOIN mlit_route_geometries rg
+                    ON rg.route_id = rs.route_id
+                WHERE rs.route_id <> '4'
+            ),
+            ordered_points AS (
+                SELECT
+                    route_id,
+                    route_long_name,
+                    trip_id,
+                    stop_sequence,
+                    stop_id,
+                    stop_name,
+                    snapped_geom,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY route_id
+                        ORDER BY stop_sequence, stop_id
+                    ) - 1 AS shape_pt_sequence,
+                    LAG(snapped_geom) OVER (
+                        PARTITION BY route_id
+                        ORDER BY stop_sequence, stop_id
+                    ) AS prev_snapped_geom
+                FROM measured_stops
+            ),
+            shape_rows AS (
+                SELECT
+                    route_id AS shape_id,
+                    ST_Y(snapped_geom) AS shape_pt_lat,
+                    ST_X(snapped_geom) AS shape_pt_lon,
+                    shape_pt_sequence,
+                    SUM(
+                        COALESCE(
+                            ST_Distance(prev_snapped_geom::geography, snapped_geom::geography),
+                            0.0
+                        )
+                    ) OVER (
+                        PARTITION BY route_id
+                        ORDER BY shape_pt_sequence
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    )::numeric(12,3) AS shape_dist_traveled
+                FROM ordered_points
+            )
+            INSERT INTO gtfs_train_shapes (
+                shape_id,
+                shape_pt_lat,
+                shape_pt_lon,
+                shape_pt_sequence,
+                shape_dist_traveled
+            )
+            SELECT
+                shape_id,
+                shape_pt_lat,
+                shape_pt_lon,
+                shape_pt_sequence,
+                shape_dist_traveled
+            FROM shape_rows
+            ORDER BY shape_id, shape_pt_sequence
+            """;
+
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            return statement.executeUpdate();
+        }
     }
 
     private static String buildInsertSql(String tableName, List<String> columns) {
@@ -346,6 +498,30 @@ public final class GtfsImporter {
             coordinates.add(new double[]{lon, lat});
         }
 
+        return coordinates;
+    }
+
+    private static String toLineStringWkt(List<double[]> coordinates) {
+        StringJoiner joiner = new StringJoiner(", ", "LINESTRING(", ")");
+        for (double[] coordinate : coordinates) {
+            joiner.add(coordinate[0] + " " + coordinate[1]);
+        }
+        return joiner.toString();
+    }
+
+    private static List<double[]> parseWktLineString(String wkt) {
+        if (wkt == null || !wkt.startsWith("LINESTRING")) {
+            return List.of();
+        }
+
+        Matcher matcher = WKT_COORDINATE_PATTERN.matcher(wkt);
+        List<double[]> coordinates = new ArrayList<>();
+        while (matcher.find()) {
+            coordinates.add(new double[]{
+                Double.parseDouble(matcher.group(1)),
+                Double.parseDouble(matcher.group(2))
+            });
+        }
         return coordinates;
     }
 
