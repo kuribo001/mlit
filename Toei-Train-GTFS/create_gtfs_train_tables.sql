@@ -3,6 +3,11 @@ BEGIN;
 CREATE EXTENSION IF NOT EXISTS postgis;
 
 DROP TABLE IF EXISTS mlit_raw_rail_segments CASCADE;
+DROP TABLE IF EXISTS mlit_route_path_edges CASCADE;
+DROP TABLE IF EXISTS mlit_stop_node_map CASCADE;
+DROP TABLE IF EXISTS mlit_network_edges CASCADE;
+DROP TABLE IF EXISTS mlit_network_nodes CASCADE;
+DROP TABLE IF EXISTS mlit_route_stop_orders CASCADE;
 DROP TABLE IF EXISTS mlit_route_geometries CASCADE;
 DROP TABLE IF EXISTS gtfs_train_stop_times CASCADE;
 DROP TABLE IF EXISTS gtfs_train_shapes CASCADE;
@@ -39,7 +44,72 @@ CREATE TABLE mlit_route_geometries (
     route_id TEXT PRIMARY KEY,
     operator_name TEXT,
     line_name TEXT,
-    geom geometry(Geometry, 4326)
+    geom geometry(Geometry, 4326),
+    pref_code TEXT,
+    agency_id TEXT
+);
+
+CREATE TABLE mlit_route_stop_orders (
+    route_id TEXT,
+    line_name TEXT,
+    trip_id TEXT,
+    stop_sequence INTEGER,
+    stop_id TEXT,
+    stop_name TEXT,
+    geom geometry(Point, 4326),
+    pref_code TEXT,
+    agency_id TEXT,
+    PRIMARY KEY (route_id, stop_sequence)
+);
+
+CREATE TABLE mlit_network_nodes (
+    node_id BIGSERIAL PRIMARY KEY,
+    route_id TEXT,
+    node_key TEXT,
+    geom geometry(Point, 4326),
+    pref_code TEXT,
+    agency_id TEXT,
+    UNIQUE (route_id, node_key)
+);
+
+CREATE TABLE mlit_network_edges (
+    edge_id BIGSERIAL PRIMARY KEY,
+    route_id TEXT,
+    line_name TEXT,
+    source_node_key TEXT,
+    target_node_key TEXT,
+    source_node_id BIGINT,
+    target_node_id BIGINT,
+    geom geometry(LineString, 4326),
+    length_m NUMERIC(12,3),
+    pref_code TEXT,
+    agency_id TEXT
+);
+
+CREATE TABLE mlit_stop_node_map (
+    route_id TEXT,
+    stop_sequence INTEGER,
+    stop_id TEXT,
+    node_id BIGINT,
+    node_key TEXT,
+    distance_m NUMERIC(12,3),
+    pref_code TEXT,
+    agency_id TEXT,
+    PRIMARY KEY (route_id, stop_sequence)
+);
+
+CREATE TABLE mlit_route_path_edges (
+    route_id TEXT,
+    from_stop_sequence INTEGER,
+    to_stop_sequence INTEGER,
+    path_order INTEGER,
+    edge_id BIGINT,
+    is_reversed SMALLINT,
+    geom geometry(LineString, 4326),
+    length_m NUMERIC(12,3),
+    pref_code TEXT,
+    agency_id TEXT,
+    PRIMARY KEY (route_id, from_stop_sequence, to_stop_sequence, path_order)
 );
 
 CREATE TABLE gtfs_train_calendar (

@@ -88,6 +88,51 @@ public final class GtfsImporter {
             }
 
             try {
+                long rowCount = importRouteStopOrders(connection);
+                connection.commit();
+                System.out.printf("Imported %-30s -> %-28s %,d row(s)%n", "GTFS route stops", "mlit_route_stop_orders", rowCount);
+            } catch (SQLException | RuntimeException e) {
+                connection.rollback();
+                throw e;
+            }
+
+            try {
+                long rowCount = importNetworkNodes(connection);
+                connection.commit();
+                System.out.printf("Imported %-30s -> %-28s %,d row(s)%n", "MLIT network nodes", "mlit_network_nodes", rowCount);
+            } catch (SQLException | RuntimeException e) {
+                connection.rollback();
+                throw e;
+            }
+
+            try {
+                long rowCount = importNetworkEdges(connection);
+                connection.commit();
+                System.out.printf("Imported %-30s -> %-28s %,d row(s)%n", "MLIT network edges", "mlit_network_edges", rowCount);
+            } catch (SQLException | RuntimeException e) {
+                connection.rollback();
+                throw e;
+            }
+
+            try {
+                long rowCount = importStopNodeMap(connection);
+                connection.commit();
+                System.out.printf("Imported %-30s -> %-28s %,d row(s)%n", "GTFS stop-node map", "mlit_stop_node_map", rowCount);
+            } catch (SQLException | RuntimeException e) {
+                connection.rollback();
+                throw e;
+            }
+
+            try {
+                long rowCount = importRoutePathEdges(connection);
+                connection.commit();
+                System.out.printf("Imported %-30s -> %-28s %,d row(s)%n", "MLIT route paths", "mlit_route_path_edges", rowCount);
+            } catch (SQLException | RuntimeException e) {
+                connection.rollback();
+                throw e;
+            }
+
+            try {
                 long rowCount = importMlitRouteGeometries(connection);
                 connection.commit();
                 System.out.printf("Imported %-30s -> %-28s %,d row(s)%n", "MLIT merged rail", "mlit_route_geometries", rowCount);
@@ -255,32 +300,7 @@ public final class GtfsImporter {
         return rowCount;
     }
 
-    private static long importMlitRouteGeometries(Connection connection) throws SQLException {
-        boolean hasPrefCode = tableHasColumn(connection, "mlit_route_geometries", "pref_code");
-        boolean hasAgencyId = tableHasColumn(connection, "mlit_route_geometries", "agency_id");
-
-        String insertColumns = """
-                route_id,
-                operator_name,
-                line_name,
-                geom
-            """;
-        String selectColumns = """
-                route_id,
-                '東京都' AS operator_name,
-                line_name,
-                ST_MakeLine(snapped_geom ORDER BY stop_sequence, stop_id) AS geom
-            """;
-
-        if (hasPrefCode) {
-            insertColumns += ",\n                pref_code";
-            selectColumns += ",\n                '13' AS pref_code";
-        }
-        if (hasAgencyId) {
-            insertColumns += ",\n                agency_id";
-            selectColumns += ",\n                'toei' AS agency_id";
-        }
-
+    private static long importRouteStopOrders(Connection connection) throws SQLException {
         String sql = """
             WITH route_map(route_id, line_name) AS (
                 VALUES
@@ -311,58 +331,485 @@ public final class GtfsImporter {
                         ORDER BY stop_count DESC, max_stop_sequence DESC, trip_id
                     ) AS rn
                 FROM trip_lengths
-            ),
-            route_stops AS (
-                SELECT
-                    r.route_id,
-                    rm.line_name,
-                    rt.trip_id,
-                    st.stop_sequence,
-                    st.stop_id,
-                    s.stop_name,
-                    ST_SetSRID(
-                        ST_MakePoint(s.stop_lon::double precision, s.stop_lat::double precision),
-                        4326
-                    ) AS stop_geom
-                FROM ranked_trips rt
-                JOIN gtfs_train_routes r
-                    ON r.route_id = rt.route_id
-                JOIN route_map rm
-                    ON rm.route_id = rt.route_id
-                JOIN gtfs_train_stop_times st
-                    ON st.trip_id = rt.trip_id
-                JOIN gtfs_train_stops s
-                    ON s.stop_id = st.stop_id
-                WHERE rt.rn = 1
-            ),
-            raw_route_geom AS (
-                SELECT
-                    rm.route_id,
-                    ST_LineMerge(ST_UnaryUnion(ST_Collect(r.geom))) AS geom
-                FROM route_map rm
-                JOIN mlit_raw_rail_segments r
-                    ON r.operator_name = '東京都'
-                   AND r.line_name = rm.line_name
-                GROUP BY rm.route_id
-            ),
-            snapped_stops AS (
-                SELECT
-                    rs.route_id,
-                    rs.line_name,
-                    rs.stop_sequence,
-                    rs.stop_id,
-                    rs.stop_name,
-                    ST_ClosestPoint(rg.geom, rs.stop_geom) AS snapped_geom
-                FROM route_stops rs
-                JOIN raw_route_geom rg
-                    ON rg.route_id = rs.route_id
             )
-            INSERT INTO mlit_route_geometries (
-            """ + insertColumns + """
+            INSERT INTO mlit_route_stop_orders (
+                route_id,
+                line_name,
+                trip_id,
+                stop_sequence,
+                stop_id,
+                stop_name,
+                geom,
+                pref_code,
+                agency_id
             )
             SELECT
-            """ + selectColumns + """
-            FROM snapped_stops
+                r.route_id,
+                rm.line_name,
+                rt.trip_id,
+                st.stop_sequence,
+                st.stop_id,
+                s.stop_name,
+                ST_SetSRID(ST_MakePoint(s.stop_lon::double precision, s.stop_lat::double precision), 4326) AS geom,
+                '13' AS pref_code,
+                'toei' AS agency_id
+            FROM ranked_trips rt
+            JOIN gtfs_train_routes r
+                ON r.route_id = rt.route_id
+            JOIN route_map rm
+                ON rm.route_id = rt.route_id
+            JOIN gtfs_train_stop_times st
+                ON st.trip_id = rt.trip_id
+            JOIN gtfs_train_stops s
+                ON s.stop_id = st.stop_id
+            WHERE rt.rn = 1
+            """;
+
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            return statement.executeUpdate();
+        }
+    }
+
+    private static long importNetworkNodes(Connection connection) throws SQLException {
+        String sql = """
+            WITH route_segments AS (
+                SELECT
+                    m.route_id,
+                    r.geom
+                FROM mlit_raw_rail_segments r
+                JOIN (
+                    VALUES
+                        ('1', '1号線浅草線'),
+                        ('2', '6号線三田線'),
+                        ('3', '10号線新宿線'),
+                        ('4', '12号線大江戸線'),
+                        ('5', '日暮里・舎人ライナー'),
+                        ('6', '荒川線')
+                ) AS m(route_id, line_name)
+                    ON r.operator_name = '東京都'
+                   AND r.line_name = m.line_name
+            ),
+            route_points AS (
+                SELECT
+                    route_id,
+                    ST_StartPoint(geom) AS pt_geom
+                FROM route_segments
+                UNION ALL
+                SELECT
+                    route_id,
+                    ST_EndPoint(geom) AS pt_geom
+                FROM route_segments
+            )
+            INSERT INTO mlit_network_nodes (
+                route_id,
+                node_key,
+                geom,
+                pref_code,
+                agency_id
+            )
+            SELECT DISTINCT
+                route_id,
+                round(ST_X(pt_geom)::numeric, 7)::text || ',' || round(ST_Y(pt_geom)::numeric, 7)::text AS node_key,
+                ST_SetSRID(ST_MakePoint(ST_X(pt_geom), ST_Y(pt_geom)), 4326) AS geom,
+                '13' AS pref_code,
+                'toei' AS agency_id
+            FROM route_points
+            """;
+
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            return statement.executeUpdate();
+        }
+    }
+
+    private static long importNetworkEdges(Connection connection) throws SQLException {
+        String sql = """
+            WITH route_segments AS (
+                SELECT
+                    m.route_id,
+                    m.line_name,
+                    r.geom
+                FROM mlit_raw_rail_segments r
+                JOIN (
+                    VALUES
+                        ('1', '1号線浅草線'),
+                        ('2', '6号線三田線'),
+                        ('3', '10号線新宿線'),
+                        ('4', '12号線大江戸線'),
+                        ('5', '日暮里・舎人ライナー'),
+                        ('6', '荒川線')
+                ) AS m(route_id, line_name)
+                    ON r.operator_name = '東京都'
+                   AND r.line_name = m.line_name
+            ),
+            prepared_edges AS (
+                SELECT
+                    route_id,
+                    line_name,
+                    round(ST_X(ST_StartPoint(geom))::numeric, 7)::text || ','
+                        || round(ST_Y(ST_StartPoint(geom))::numeric, 7)::text AS source_node_key,
+                    round(ST_X(ST_EndPoint(geom))::numeric, 7)::text || ','
+                        || round(ST_Y(ST_EndPoint(geom))::numeric, 7)::text AS target_node_key,
+                    geom,
+                    ST_Length(geom::geography)::numeric(12,3) AS length_m
+                FROM route_segments
+            )
+            INSERT INTO mlit_network_edges (
+                route_id,
+                line_name,
+                source_node_key,
+                target_node_key,
+                source_node_id,
+                target_node_id,
+                geom,
+                length_m,
+                pref_code,
+                agency_id
+            )
+            SELECT
+                e.route_id,
+                e.line_name,
+                e.source_node_key,
+                e.target_node_key,
+                sn.node_id AS source_node_id,
+                tn.node_id AS target_node_id,
+                e.geom,
+                e.length_m,
+                '13' AS pref_code,
+                'toei' AS agency_id
+            FROM prepared_edges e
+            JOIN mlit_network_nodes sn
+                ON sn.route_id = e.route_id
+               AND sn.node_key = e.source_node_key
+            JOIN mlit_network_nodes tn
+                ON tn.route_id = e.route_id
+               AND tn.node_key = e.target_node_key
+            """;
+
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            return statement.executeUpdate();
+        }
+    }
+
+    private static long importStopNodeMap(Connection connection) throws SQLException {
+        String sql = """
+            WITH ranked_nodes AS (
+                SELECT
+                    rso.route_id,
+                    rso.stop_sequence,
+                    rso.stop_id,
+                    nn.node_id,
+                    nn.node_key,
+                    ST_Distance(rso.geom::geography, nn.geom::geography)::numeric(12,3) AS distance_m,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY rso.route_id, rso.stop_sequence
+                        ORDER BY rso.geom <-> nn.geom,
+                                 ST_Distance(rso.geom::geography, nn.geom::geography)
+                    ) AS rn
+                FROM mlit_route_stop_orders rso
+                JOIN mlit_network_nodes nn
+                    ON nn.route_id = rso.route_id
+            )
+            INSERT INTO mlit_stop_node_map (
+                route_id,
+                stop_sequence,
+                stop_id,
+                node_id,
+                node_key,
+                distance_m,
+                pref_code,
+                agency_id
+            )
+            SELECT
+                route_id,
+                stop_sequence,
+                stop_id,
+                node_id,
+                node_key,
+                distance_m,
+                '13' AS pref_code,
+                'toei' AS agency_id
+            FROM ranked_nodes
+            WHERE rn = 1
+            """;
+
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            return statement.executeUpdate();
+        }
+    }
+
+    private static long importRoutePathEdges(Connection connection) throws SQLException {
+        String sql = """
+            WITH RECURSIVE stop_pairs AS (
+                SELECT
+                    s.route_id,
+                    s.stop_sequence AS from_stop_sequence,
+                    LEAD(s.stop_sequence) OVER (
+                        PARTITION BY s.route_id
+                        ORDER BY s.stop_sequence
+                    ) AS to_stop_sequence,
+                    n.node_id AS from_node_id,
+                    LEAD(n.node_id) OVER (
+                        PARTITION BY s.route_id
+                        ORDER BY s.stop_sequence
+                    ) AS to_node_id
+                FROM mlit_route_stop_orders s
+                JOIN mlit_stop_node_map n
+                    ON n.route_id = s.route_id
+                   AND n.stop_sequence = s.stop_sequence
+            ),
+            filtered_pairs AS (
+                SELECT *
+                FROM stop_pairs
+                WHERE to_stop_sequence IS NOT NULL
+                  AND from_node_id IS NOT NULL
+                  AND to_node_id IS NOT NULL
+                  AND from_node_id <> to_node_id
+            ),
+            directed_edges AS (
+                SELECT
+                    edge_id,
+                    route_id,
+                    source_node_id AS from_node_id,
+                    target_node_id AS to_node_id,
+                    geom,
+                    length_m,
+                    0::smallint AS is_reversed
+                FROM mlit_network_edges
+                UNION ALL
+                SELECT
+                    edge_id,
+                    route_id,
+                    target_node_id AS from_node_id,
+                    source_node_id AS to_node_id,
+                    ST_Reverse(geom) AS geom,
+                    length_m,
+                    1::smallint AS is_reversed
+                FROM mlit_network_edges
+            ),
+            search_paths AS (
+                SELECT
+                    p.route_id,
+                    p.from_stop_sequence,
+                    p.to_stop_sequence,
+                    p.from_node_id,
+                    p.to_node_id,
+                    de.to_node_id AS current_node_id,
+                    ARRAY[p.from_node_id, de.to_node_id]::bigint[] AS visited_nodes,
+                    ARRAY[de.edge_id]::bigint[] AS edge_ids,
+                    ARRAY[de.is_reversed]::smallint[] AS reverse_flags,
+                    de.length_m AS total_length,
+                    1 AS depth
+                FROM filtered_pairs p
+                JOIN directed_edges de
+                    ON de.route_id = p.route_id
+                   AND de.from_node_id = p.from_node_id
+                UNION ALL
+                SELECT
+                    sp.route_id,
+                    sp.from_stop_sequence,
+                    sp.to_stop_sequence,
+                    sp.from_node_id,
+                    sp.to_node_id,
+                    de.to_node_id AS current_node_id,
+                    sp.visited_nodes || de.to_node_id,
+                    sp.edge_ids || de.edge_id,
+                    sp.reverse_flags || de.is_reversed,
+                    (sp.total_length + de.length_m)::numeric(12,3) AS total_length,
+                    sp.depth + 1
+                FROM search_paths sp
+                JOIN directed_edges de
+                    ON de.route_id = sp.route_id
+                   AND de.from_node_id = sp.current_node_id
+                WHERE sp.current_node_id <> sp.to_node_id
+                  AND sp.depth < 12
+                  AND NOT (de.to_node_id = ANY(sp.visited_nodes))
+            ),
+            best_paths AS (
+                SELECT DISTINCT ON (route_id, from_stop_sequence, to_stop_sequence)
+                    route_id,
+                    from_stop_sequence,
+                    to_stop_sequence,
+                    edge_ids,
+                    reverse_flags,
+                    total_length
+                FROM search_paths
+                WHERE current_node_id = to_node_id
+                ORDER BY
+                    route_id,
+                    from_stop_sequence,
+                    to_stop_sequence,
+                    total_length,
+                    array_length(edge_ids, 1)
+            ),
+            expanded_paths AS (
+                SELECT
+                    bp.route_id,
+                    bp.from_stop_sequence,
+                    bp.to_stop_sequence,
+                    u.ordinality::integer AS path_order,
+                    u.edge_id,
+                    bp.reverse_flags[u.ordinality] AS is_reversed
+                FROM best_paths bp
+                CROSS JOIN LATERAL unnest(bp.edge_ids) WITH ORDINALITY AS u(edge_id, ordinality)
+            )
+            INSERT INTO mlit_route_path_edges (
+                route_id,
+                from_stop_sequence,
+                to_stop_sequence,
+                path_order,
+                edge_id,
+                is_reversed,
+                geom,
+                length_m,
+                pref_code,
+                agency_id
+            )
+            SELECT
+                ep.route_id,
+                ep.from_stop_sequence,
+                ep.to_stop_sequence,
+                ep.path_order,
+                ep.edge_id,
+                ep.is_reversed,
+                CASE
+                    WHEN ep.is_reversed = 1 THEN ST_Reverse(e.geom)
+                    ELSE e.geom
+                END AS geom,
+                e.length_m,
+                '13' AS pref_code,
+                'toei' AS agency_id
+            FROM expanded_paths ep
+            JOIN mlit_network_edges e
+                ON e.edge_id = ep.edge_id
+            """;
+
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            long rowCount = statement.executeUpdate();
+            ensureRoutePathCoverage(connection);
+            return rowCount;
+        }
+    }
+
+    private static void ensureRoutePathCoverage(Connection connection) throws SQLException {
+        String sql = """
+            WITH stop_pairs AS (
+                SELECT
+                    s.route_id,
+                    s.stop_sequence AS from_stop_sequence,
+                    LEAD(s.stop_sequence) OVER (
+                        PARTITION BY s.route_id
+                        ORDER BY s.stop_sequence
+                    ) AS to_stop_sequence
+                    ,
+                    n.node_id AS from_node_id,
+                    LEAD(n.node_id) OVER (
+                        PARTITION BY s.route_id
+                        ORDER BY s.stop_sequence
+                    ) AS to_node_id
+                FROM mlit_route_stop_orders s
+                JOIN mlit_stop_node_map n
+                    ON n.route_id = s.route_id
+                   AND n.stop_sequence = s.stop_sequence
+            ),
+            expected_pairs AS (
+                SELECT
+                    route_id,
+                    from_stop_sequence,
+                    to_stop_sequence
+                FROM stop_pairs
+                WHERE to_stop_sequence IS NOT NULL
+                  AND from_node_id <> to_node_id
+            ),
+            covered_pairs AS (
+                SELECT DISTINCT
+                    route_id,
+                    from_stop_sequence,
+                    to_stop_sequence
+                FROM mlit_route_path_edges
+            )
+            SELECT
+                e.route_id,
+                e.from_stop_sequence,
+                e.to_stop_sequence
+            FROM expected_pairs e
+            LEFT JOIN covered_pairs c
+                ON c.route_id = e.route_id
+               AND c.from_stop_sequence = e.from_stop_sequence
+               AND c.to_stop_sequence = e.to_stop_sequence
+            WHERE c.route_id IS NULL
+            ORDER BY e.route_id, e.from_stop_sequence
+            LIMIT 1
+            """;
+
+        try (PreparedStatement statement = connection.prepareStatement(sql);
+             ResultSet resultSet = statement.executeQuery()) {
+            if (resultSet.next()) {
+                throw new SQLException(
+                    "Không tìm thấy path giữa stop_sequence "
+                        + resultSet.getInt("from_stop_sequence")
+                        + " -> "
+                        + resultSet.getInt("to_stop_sequence")
+                        + " của route "
+                        + resultSet.getString("route_id")
+                );
+            }
+        }
+    }
+
+    private static long importMlitRouteGeometries(Connection connection) throws SQLException {
+        String sql = """
+            WITH ordered_segments AS (
+                SELECT
+                    p.route_id,
+                    s.line_name,
+                    p.from_stop_sequence,
+                    p.path_order,
+                    p.geom
+                FROM mlit_route_path_edges p
+                JOIN (
+                    SELECT DISTINCT route_id, line_name
+                    FROM mlit_route_stop_orders
+                ) s
+                    ON s.route_id = p.route_id
+            ),
+            segment_points AS (
+                SELECT
+                    route_id,
+                    line_name,
+                    from_stop_sequence,
+                    path_order,
+                    (dp).path[1] AS point_order,
+                    (dp).geom AS pt_geom
+                FROM ordered_segments
+                CROSS JOIN LATERAL ST_DumpPoints(ST_RemoveRepeatedPoints(geom)) dp
+            ),
+            ordered_points AS (
+                SELECT
+                    route_id,
+                    line_name,
+                    pt_geom,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY route_id
+                        ORDER BY from_stop_sequence, path_order, point_order
+                    ) AS global_order
+                FROM segment_points
+            )
+            INSERT INTO mlit_route_geometries (
+                route_id,
+                operator_name,
+                line_name,
+                geom,
+                pref_code,
+                agency_id
+            )
+            SELECT
+                route_id,
+                '東京都' AS operator_name,
+                line_name,
+                ST_RemoveRepeatedPoints(ST_MakeLine(pt_geom ORDER BY global_order)) AS geom,
+                '13' AS pref_code,
+                'toei' AS agency_id
+            FROM ordered_points
             GROUP BY route_id, line_name
             """;
 

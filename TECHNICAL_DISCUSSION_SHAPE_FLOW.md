@@ -8,6 +8,18 @@ Xây dựng `shape` cho từng tuyến Toei từ dữ liệu đường sắt raw
 - `mlit_raw_rail_segments`
   - dữ liệu raw đường sắt MLIT
   - hình học lưu trong `geom` dạng `LINESTRING`
+- `mlit_route_stop_orders`
+  - stop order đại diện cho từng route
+- `mlit_network_nodes`
+  - node graph dựng từ endpoint của raw segment
+- `mlit_network_edges`
+  - edge graph dựng từ raw segment
+- `mlit_stop_node_map`
+  - mapping stop GTFS -> node gần nhất trên graph
+- `mlit_route_path_edges`
+  - path edge cho từng cặp stop liên tiếp
+- `mlit_route_geometries`
+  - geometry cấp tuyến sau khi ghép path
 - `gtfs_train_routes`
   - dữ liệu master của tuyến
 - `gtfs_train_trips`
@@ -42,15 +54,12 @@ Xây dựng `shape` cho từng tuyến Toei từ dữ liệu đường sắt raw
 - Insert từng segment raw vào `mlit_raw_rail_segments`.
 - Giữ nguyên `geom` dạng `geometry(LineString, 4326)`.
 
-### Bước 1.1: Merge segment theo tuyến
+### Bước 1.1: Dựng graph segment theo tuyến
 
-- Sau khi lưu raw xong, dùng thứ tự stop của GTFS để nối các segment theo đúng hướng tuyến.
-- Tạo một geometry cấp tuyến thay vì chỉ từng segment rời.
-- Lưu geometry đã dựng lại vào một bảng khác, ví dụ:
-  - `mlit_route_geometries`
-  - hoặc tên tương đương theo convention của dự án
-- Bảng này sẽ được dùng cho bước snap stop và build shape.
-- Các tuyến có `MultiLineString` raw sẽ được chuẩn hóa về `LineString` theo stop order.
+- Sau khi lưu raw xong, dựng graph từ các segment:
+  - endpoint của segment -> `mlit_network_nodes`
+  - segment -> `mlit_network_edges`
+- Đây là network gốc để tìm path giữa các stop liên tiếp.
 
 ### Bước 2: Xây dựng thứ tự stop từ GTFS
 
@@ -58,21 +67,29 @@ Xây dựng `shape` cho từng tuyến Toei từ dữ liệu đường sắt raw
   - tìm các trip thuộc tuyến đó
   - chọn một trip đại diện hoặc pattern stop đã gộp
   - trích ra danh sách stop theo thứ tự từ `stop_times`
+  - lưu vào `mlit_route_stop_orders`
 
-### Bước 3: Tạo geometry của tuyến
+### Bước 3: Snap stop vào graph
 
-- Gộp các segment raw MLIT thuộc cùng một tuyến.
-- Dùng stop order GTFS để sắp xếp lại điểm chạy của tuyến.
-- Tạo ra một `LINESTRING` cấp tuyến đã được dựng lại theo thứ tự stop.
+- Với mỗi stop trong route:
+  - tìm node gần nhất trong graph cùng tuyến
+  - lưu vào `mlit_stop_node_map`
 
-### Bước 4: Snap stop lên geometry tuyến
+### Bước 4: Tìm path giữa hai stop liên tiếp
 
-- Với mỗi stop trong thứ tự tuyến:
-  - chuyển lat/lon stop thành point
-  - snap point đó lên geometry tuyến
-  - tính measure / khoảng cách dọc theo tuyến
+- Với mỗi cặp stop liên tiếp:
+  - lấy `from_node`
+  - lấy `to_node`
+  - tìm path ngắn nhất trên `mlit_network_edges`
+  - lưu kết quả vào `mlit_route_path_edges`
 
-### Bước 5: Tạo các dòng shape
+### Bước 5: Tạo geometry cấp tuyến
+
+- Ghép toàn bộ `mlit_route_path_edges` theo đúng thứ tự stop
+- Dựng lại `mlit_route_geometries`
+- Kết quả là geometry tuyến bám theo network MLIT thật, thay vì nối thẳng stop
+
+### Bước 6: Tạo các dòng shape
 
 - Đọc `LINESTRING` từ `mlit_route_geometries`.
 - Tách `LINESTRING` thành các point theo thứ tự hình học.
@@ -96,5 +113,6 @@ Xây dựng `shape` cho từng tuyến Toei từ dữ liệu đường sắt raw
 ## Kết quả mong đợi
 
 - Một shape theo cấp tuyến, đi đúng thứ tự stop.
+- Shape bám sát polyline MLIT hơn, hiển thị mượt hơn trên map.
 - Luồng import ổn định, có thể chạy lại.
 - Mapping rõ ràng từ route -> stop order -> shape points.
