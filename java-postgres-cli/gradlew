@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+
+APP_HOME=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+GRADLE_VERSION="9.5.1"
+DIST_DIR="$APP_HOME/.gradle-dist"
+GRADLE_DIR="$DIST_DIR/gradle-$GRADLE_VERSION"
+ZIP_FILE="$DIST_DIR/gradle-$GRADLE_VERSION-bin.zip"
+DIST_URL="https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip"
+
+download_gradle() {
+  mkdir -p "$DIST_DIR"
+
+  if [ ! -f "$ZIP_FILE" ]; then
+    echo "Downloading Gradle $GRADLE_VERSION..."
+    if command -v curl >/dev/null 2>&1; then
+      curl -L -o "$ZIP_FILE" "$DIST_URL"
+    elif command -v wget >/dev/null 2>&1; then
+      wget -O "$ZIP_FILE" "$DIST_URL"
+    else
+      echo "curl or wget is required to download Gradle." >&2
+      exit 1
+    fi
+  fi
+
+  echo "Extracting Gradle $GRADLE_VERSION..."
+  unzip -q -o "$ZIP_FILE" -d "$DIST_DIR"
+}
+
+if [ ! -x "$GRADLE_DIR/bin/gradle" ]; then
+  download_gradle
+fi
+
+exec "$GRADLE_DIR/bin/gradle" "$@"
