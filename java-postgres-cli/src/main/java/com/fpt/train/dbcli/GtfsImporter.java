@@ -256,13 +256,32 @@ public final class GtfsImporter {
     }
 
     private static long importMlitRouteGeometries(Connection connection) throws SQLException {
-        String sql = """
-            INSERT INTO mlit_route_geometries (
+        boolean hasPrefCode = tableHasColumn(connection, "mlit_route_geometries", "pref_code");
+        boolean hasAgencyId = tableHasColumn(connection, "mlit_route_geometries", "agency_id");
+
+        String insertColumns = """
                 route_id,
                 operator_name,
                 line_name,
                 geom
-            )
+            """;
+        String selectColumns = """
+                route_id,
+                '東京都' AS operator_name,
+                line_name,
+                ST_MakeLine(snapped_geom ORDER BY stop_sequence, stop_id) AS geom
+            """;
+
+        if (hasPrefCode) {
+            insertColumns += ",\n                pref_code";
+            selectColumns += ",\n                '13' AS pref_code";
+        }
+        if (hasAgencyId) {
+            insertColumns += ",\n                agency_id";
+            selectColumns += ",\n                'toei' AS agency_id";
+        }
+
+        String sql = """
             WITH route_map(route_id, line_name) AS (
                 VALUES
                     ('1', '1号線浅草線'),
@@ -271,26 +290,7 @@ public final class GtfsImporter {
                     ('4', '12号線大江戸線'),
                     ('5', '日暮里・舎人ライナー'),
                     ('6', '荒川線')
-            )
-            SELECT
-                rm.route_id,
-                '東京都' AS operator_name,
-                rm.line_name,
-                ST_LineMerge(ST_UnaryUnion(ST_Collect(r.geom))) AS geom
-            FROM route_map rm
-            JOIN mlit_raw_rail_segments r
-                ON r.operator_name = '東京都'
-               AND r.line_name = rm.line_name
-            GROUP BY rm.route_id, rm.line_name
-            """;
-
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
-            return statement.executeUpdate();
-        }
-    }
-
-    private static long importToeiShapesFromRouteGeometries(Connection connection) throws SQLException {
-        String sql = """
+            ),
             trip_lengths AS (
                 SELECT
                     t.route_id,
@@ -315,66 +315,92 @@ public final class GtfsImporter {
             route_stops AS (
                 SELECT
                     r.route_id,
-                    r.route_long_name,
+                    rm.line_name,
                     rt.trip_id,
                     st.stop_sequence,
                     st.stop_id,
                     s.stop_name,
-                    ST_SetSRID(ST_MakePoint(s.stop_lon::double precision, s.stop_lat::double precision), 4326) AS stop_geom
+                    ST_SetSRID(
+                        ST_MakePoint(s.stop_lon::double precision, s.stop_lat::double precision),
+                        4326
+                    ) AS stop_geom
                 FROM ranked_trips rt
                 JOIN gtfs_train_routes r
                     ON r.route_id = rt.route_id
+                JOIN route_map rm
+                    ON rm.route_id = rt.route_id
                 JOIN gtfs_train_stop_times st
                     ON st.trip_id = rt.trip_id
                 JOIN gtfs_train_stops s
                     ON s.stop_id = st.stop_id
                 WHERE rt.rn = 1
-                  AND rt.route_id <> '4'
             ),
-            measured_stops AS (
+            raw_route_geom AS (
+                SELECT
+                    rm.route_id,
+                    ST_LineMerge(ST_UnaryUnion(ST_Collect(r.geom))) AS geom
+                FROM route_map rm
+                JOIN mlit_raw_rail_segments r
+                    ON r.operator_name = '東京都'
+                   AND r.line_name = rm.line_name
+                GROUP BY rm.route_id
+            ),
+            snapped_stops AS (
                 SELECT
                     rs.route_id,
-                    rs.route_long_name,
-                    rs.trip_id,
+                    rs.line_name,
                     rs.stop_sequence,
                     rs.stop_id,
                     rs.stop_name,
-                    rg.geom AS route_geom,
-                    ST_ClosestPoint(rg.geom, rs.stop_geom) AS snapped_geom,
-                    ST_LineLocatePoint(rg.geom, ST_ClosestPoint(rg.geom, rs.stop_geom)) AS measure
+                    ST_ClosestPoint(rg.geom, rs.stop_geom) AS snapped_geom
                 FROM route_stops rs
-                JOIN mlit_route_geometries rg
+                JOIN raw_route_geom rg
                     ON rg.route_id = rs.route_id
-                WHERE rs.route_id <> '4'
-            ),
-            ordered_points AS (
+            )
+            INSERT INTO mlit_route_geometries (
+            """ + insertColumns + """
+            )
+            SELECT
+            """ + selectColumns + """
+            FROM snapped_stops
+            GROUP BY route_id, line_name
+            """;
+
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            return statement.executeUpdate();
+        }
+    }
+
+    private static long importToeiShapesFromRouteGeometries(Connection connection) throws SQLException {
+        String sql = """
+            WITH dumped_points AS (
                 SELECT
                     route_id,
-                    route_long_name,
-                    trip_id,
-                    stop_sequence,
-                    stop_id,
-                    stop_name,
-                    snapped_geom,
-                    ROW_NUMBER() OVER (
+                    (dp).path[1] - 1 AS shape_pt_sequence,
+                    (dp).geom AS pt_geom
+                FROM mlit_route_geometries
+                CROSS JOIN LATERAL ST_DumpPoints(ST_RemoveRepeatedPoints(geom)) dp
+            ),
+            lagged_points AS (
+                SELECT
+                    route_id,
+                    shape_pt_sequence,
+                    pt_geom,
+                    LAG(pt_geom) OVER (
                         PARTITION BY route_id
-                        ORDER BY stop_sequence, stop_id
-                    ) - 1 AS shape_pt_sequence,
-                    LAG(snapped_geom) OVER (
-                        PARTITION BY route_id
-                        ORDER BY stop_sequence, stop_id
-                    ) AS prev_snapped_geom
-                FROM measured_stops
+                        ORDER BY shape_pt_sequence
+                    ) AS prev_pt_geom
+                FROM dumped_points
             ),
             shape_rows AS (
                 SELECT
                     route_id AS shape_id,
-                    ST_Y(snapped_geom) AS shape_pt_lat,
-                    ST_X(snapped_geom) AS shape_pt_lon,
+                    ST_Y(pt_geom) AS shape_pt_lat,
+                    ST_X(pt_geom) AS shape_pt_lon,
                     shape_pt_sequence,
                     SUM(
                         COALESCE(
-                            ST_Distance(prev_snapped_geom::geography, snapped_geom::geography),
+                            ST_Distance(prev_pt_geom::geography, pt_geom::geography),
                             0.0
                         )
                     ) OVER (
@@ -382,21 +408,27 @@ public final class GtfsImporter {
                         ORDER BY shape_pt_sequence
                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                     )::numeric(12,3) AS shape_dist_traveled
-                FROM ordered_points
+                FROM lagged_points
             )
             INSERT INTO gtfs_train_shapes (
                 shape_id,
                 shape_pt_lat,
                 shape_pt_lon,
                 shape_pt_sequence,
-                shape_dist_traveled
+                shape_dist_traveled,
+                cumulative_distance_m,
+                pref_code,
+                agency_id
             )
             SELECT
                 shape_id,
                 shape_pt_lat,
                 shape_pt_lon,
                 shape_pt_sequence,
-                shape_dist_traveled
+                shape_dist_traveled,
+                shape_dist_traveled AS cumulative_distance_m,
+                '13' AS pref_code,
+                'toei' AS agency_id
             FROM shape_rows
             ORDER BY shape_id, shape_pt_sequence
             """;
@@ -429,6 +461,13 @@ public final class GtfsImporter {
         }
 
         return columnTypes;
+    }
+
+    private static boolean tableHasColumn(Connection connection, String tableName, String columnName) throws SQLException {
+        DatabaseMetaData metaData = connection.getMetaData();
+        try (ResultSet columns = metaData.getColumns(null, null, tableName, columnName)) {
+            return columns.next();
+        }
     }
 
     private static void bindRow(
